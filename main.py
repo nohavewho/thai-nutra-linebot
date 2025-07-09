@@ -1,20 +1,17 @@
-from fastapi import FastAPI, Request, HTTPException
+from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 import os
-import asyncpg
-import httpx
-from pydantic import BaseModel
-import asyncio
-from typing import Optional
+import requests
+import json
 import logging
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Thai Nutra LINE Bot")
+app = Flask(__name__)
 
 # LINE Bot настройки
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
@@ -22,19 +19,10 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not all([LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, OPENAI_API_KEY]):
-    raise ValueError("Missing required environment variables")
-
+    logger.error("Missing required environment variables")
+    
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
-
-# Простая база данных в памяти для тестирования
-user_sessions = {}
-
-class UserSession:
-    def __init__(self, user_id: str):
-        self.user_id = user_id
-        self.conversation_history = []
-        self.current_product_interest = None
 
 # Агрессивный промпт для продажи тайских нутрицевтиков
 AGGRESSIVE_SALES_PROMPT = """
@@ -61,69 +49,58 @@ AGGRESSIVE_SALES_PROMPT = """
 Всегда заканчивай сообщения призывом к покупке!
 """
 
-async def call_openai(message: str, user_session: UserSession) -> str:
+def call_openai(message):
     """Вызов OpenAI API для генерации ответа"""
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "gpt-3.5-turbo",
-                    "messages": [
-                        {"role": "system", "content": AGGRESSIVE_SALES_PROMPT},
-                        {"role": "user", "content": message}
-                    ],
-                    "max_tokens": 500,
-                    "temperature": 0.8
-                }
-            )
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "gpt-3.5-turbo",
+                "messages": [
+                    {"role": "system", "content": AGGRESSIVE_SALES_PROMPT},
+                    {"role": "user", "content": message}
+                ],
+                "max_tokens": 500,
+                "temperature": 0.8
+            }
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result["choices"][0]["message"]["content"]
+        else:
+            logger.error(f"OpenAI API error: {response.status_code}")
+            return "สวัสดีครับ! ผมสมชาย ผู้เชี่ยวชาญด้านนูทราซูติคัลไทย! วันนี้มีโปรโมชั่นพิเศษสำหรับคุณ! 💊✨"
             
-            if response.status_code == 200:
-                result = response.json()
-                return result["choices"][0]["message"]["content"]
-            else:
-                logger.error(f"OpenAI API error: {response.status_code}")
-                return "Извините, произошла ошибка. Попробуйте позже."
-                
     except Exception as e:
         logger.error(f"Error calling OpenAI: {e}")
-        return "Извините, произошла ошибка. Попробуйте позже."
+        return "สวัสดีครับ! ผมสมชาย ผู้เชี่ยวชาญด้านนูทราซูติคัลไทย! วันนี้มีโปรโมชั่นพิเศษสำหรับคุณ! 💊✨"
 
-@app.post("/webhook")
-async def webhook(request: Request):
+@app.route("/webhook", methods=['POST'])
+def webhook():
     """Обработка webhook от LINE"""
     signature = request.headers.get('X-Line-Signature', '')
-    body = await request.body()
+    body = request.get_data(as_text=True)
     
     try:
-        handler.handle(body.decode('utf-8'), signature)
+        handler.handle(body, signature)
     except InvalidSignatureError:
-        raise HTTPException(status_code=400, detail="Invalid signature")
+        abort(400)
     
-    return {"status": "ok"}
+    return 'OK'
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     """Обработка текстовых сообщений"""
-    user_id = event.source.user_id
     user_message = event.message.text
     
-    # Получаем или создаем сессию пользователя
-    if user_id not in user_sessions:
-        user_sessions[user_id] = UserSession(user_id)
-    
-    user_session = user_sessions[user_id]
-    
-    # Асинхронный вызов OpenAI
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
     try:
-        ai_response = loop.run_until_complete(call_openai(user_message, user_session))
+        # Вызов OpenAI для генерации ответа
+        ai_response = call_openai(user_message)
         
         # Отправляем ответ пользователю
         line_bot_api.reply_message(
@@ -131,31 +108,23 @@ def handle_message(event):
             TextSendMessage(text=ai_response)
         )
         
-        # Сохраняем в историю
-        user_session.conversation_history.append({
-            "user": user_message,
-            "bot": ai_response
-        })
-        
     except Exception as e:
         logger.error(f"Error handling message: {e}")
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text="Извините, произошла ошибка. Попробуйте позже.")
+            TextSendMessage(text="สวัสดีครับ! ผมสมชาย ผู้เชี่ยวชาญด้านนูทราซูติคัลไทย! วันนี้มีโปรโมชั่นพิเศษสำหรับคุณ! 💊✨")
         )
-    finally:
-        loop.close()
 
-@app.get("/")
-async def root():
+@app.route("/")
+def root():
     """Главная страница"""
-    return {"message": "Thai Nutra LINE Bot is running!"}
+    return "Thai Nutra LINE Bot is running!"
 
-@app.get("/health")
-async def health():
+@app.route("/health")
+def health():
     """Проверка здоровья сервиса"""
     return {"status": "healthy", "bot_configured": bool(LINE_CHANNEL_ACCESS_TOKEN)}
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=False)
